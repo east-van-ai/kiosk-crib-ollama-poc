@@ -1,0 +1,15 @@
+# public-repo-generator <https://github.com/east-van-ai/public-repo-generator>
+# weed-out <https://github.com/east-van-ai/weed-out>
+
+.git/
+.gitignore
+.weed-out-ignore
+backend_ollama.py
+carbonara.py
+kiosk.py
+mcp_client.py
+mcp_server.py
+tests/
+Dockerfile
+LICENSE
+README.md
