@@ -2,6 +2,7 @@
 # weed-out <https://github.com/east-van-ai/weed-out>
 
 .git/
+.github/**/*.yaml
 .gitignore
 .weed-out-ignore
 backend_ollama.py

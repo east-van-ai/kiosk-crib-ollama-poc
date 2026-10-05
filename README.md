@@ -1,5 +1,7 @@
 # carbonara no-framework ollama with kiosk and crib
 
+![CI](https://github.com/east-van-ai/kiosk-crib-ollama-poc/actions/workflows/ci.yaml/badge.svg)
+
 This project separates an AI agent's intelligence from its authority. The
 agent runs inside a disposable Docker container with no network. It cannot
 reach the AI model. It can only ask. A small trusted process on the Mac, the
