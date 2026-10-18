@@ -8,15 +8,15 @@
 
 The Kiosk: the trusted host process between the Agent and its capabilities.
 
-It starts the Agent in the Crib, a disposable Docker container with no
-network, and serves MCP on the container's standard streams. The Agent asks
-for inference through the `ask_ai` tool. The Kiosk checks the request, queries
-Ollama itself, and hands back the text. The Agent never learns the model or
-where it runs.
+It starts the Agent in the Crib and serves MCP on the Crib's standard
+streams. The Crib's flavour, how it is made, is picked per run from `CRIB`.
+The Agent asks for inference through the `ask_ai` tool. The Kiosk checks the
+request, queries Ollama itself, and hands back the text. The Agent never
+learns the model or where it runs.
 
-This file holds what the Kiosk is and allows: the policy, the Crib's
-confinement, and the greeting. It juggles the rest. How to speak MCP lives
-in `mcp_server.py`, and how to reach the model in `backend_ollama.py`.
+This file holds what the Kiosk is and allows: the policy and the greeting.
+It juggles the rest. How to speak MCP lives in `mcp_server.py`, how to reach
+the model in `backend_ollama.py`, and how to make each Crib in `crib_*.py`.
 
 The Kiosk is the server and the Agent the client, although the Kiosk
 launches the Agent. The framing does not care who started whom.
@@ -24,23 +24,44 @@ launches the Agent. The framing does not care who started whom.
 
 import json
 import os
+import shlex
+import subprocess
 import sys
+import threading
 
 import backend_ollama as inference
+import crib_apple_container
+import crib_container_machine
+import crib_docker
 import mcp_server
 
-SERVER_INFO = {"name": "kiosk", "version": "0.1.0"}
+SERVER_INFO = {"name": "kiosk", "version": "0.2.0"}
 
-IMAGE = "kiosk-crib"
+#: The Crib's flavours, by the name `CRIB` picks them with. The first is the default.
+CRIBS = {
+    "docker": crib_docker,
+    "apple-container": crib_apple_container,
+    "container-machine": crib_container_machine,
+}
+
 #: The only host variables that reach the Crib. Each is copied by name.
 PASSED = ("CARBONARA_ORDER", "CARBONARA_TEMPERATURE", "CARBONARA_STREAM_DELAY")
 
 #: Inference calls allowed per run. A carbonara takes at most eight.
 CALL_BUDGET = 20
+#: Seconds a run may take. A carbonara takes about thirty.
+RUN_LIMIT = 300
+#: Seconds a stop may take. Stopping a container machine takes about ten.
+STOP_WAIT = 30
 
 #: The Kiosk's exit statuses. A clean run passes the Agent app's own through.
+#: Ctrl-C sends SIGINT, signal 2; the shell reports it as status 128 + 2 = 130.
+#: 124 is what `timeout` reports for a command it had to stop.
 EXIT_OK = 0
 EXIT_PROTOCOL_VIOLATION = 1
+EXIT_USAGE = 2
+EXIT_BUDGET_SPENT = 3
+EXIT_TIME_LIMIT = 124
 EXIT_INTERRUPTED = 130
 
 #: Print every MCP message as it crosses, when MCP_TRACE is 1.
@@ -63,19 +84,18 @@ ASK_AI = {
     },
 }
 
-#: What each confinement flag means, in the order the greeting says it.
-CONFINEMENT = (
-    (("--rm",), "removed on exit"),
-    (("--network", "none"), "no network"),
-    (("--read-only",), "read-only"),
-    (("--cap-drop", "ALL"), "no capabilities"),
-    (("--security-opt", "no-new-privileges"), "no new privileges"),
-    (("--user", "nobody"), "runs as nobody"),
-)
-
 MAGENTA = "\033[95m"
 LIGHT_GREY = "\033[37m"
 RESET = "\033[0m"
+
+
+class BudgetSpent(Exception):
+    """The Agent asked for one inference call more than a run allows."""
+
+
+def pick_crib():
+    """Return the flavour module `CRIB` names, Docker when unset, or None for an unknown name."""
+    return CRIBS.get(os.environ.get("CRIB", "docker"))
 
 
 def log_line(text):
@@ -96,29 +116,14 @@ def trace_line(direction, line):
     print(f"{LIGHT_GREY}[MCP {TRACE_LABELS[direction]}]\n{shown}{RESET}", file=sys.stderr, flush=True)
 
 
-def docker_command():
-    """Return the `docker run` line that starts the Crib."""
-    passed = [flag for name in PASSED for flag in ("-e", name)]
-    return [
-        "docker", "run", "--rm", "-i", "--init",
-        "--network", "none",
-        "--read-only",
-        "--cap-drop", "ALL",
-        "--security-opt", "no-new-privileges",
-        "--user", "nobody",
-        *passed,
-        IMAGE,
-    ]
-
-
-def crib_facts(command):
-    """Return the confinement phrases whose flags appear in a `docker run` line.
+def crib_facts(command, confinement):
+    """Return the confinement phrases whose flags appear on a Crib's launch line.
 
     A phrase is claimed only when its whole flag, value included, is on the
     line, so the greeting cannot outlive a flag.
     """
     facts = []
-    for flag, phrase in CONFINEMENT:
+    for flag, phrase in confinement:
         width = len(flag)
         if any(tuple(command[i:i + width]) == flag for i in range(len(command))):
             facts.append(phrase)
@@ -149,7 +154,9 @@ def build_tools(infer):
     """Return the Kiosk's tool registry, with `ask_ai` performed by `infer`.
 
     The handler holds the policy: the argument check, then the budget, then
-    the inference. `infer` is passed in, so tests can hand in a fake.
+    the inference. A bad argument is refused and the run goes on. A call past
+    the budget raises BudgetSpent, which ends the run. `infer` is passed in,
+    so tests can hand in a fake.
     """
     spent = 0
 
@@ -161,8 +168,7 @@ def build_tools(infer):
             log_line(f"ask_ai refused: {problem}")
             raise mcp_server.ToolRefusal(problem)
         if spent >= CALL_BUDGET:
-            log_line(f"ask_ai refused: budget of {CALL_BUDGET} spent")
-            raise mcp_server.ToolRefusal(f"call budget of {CALL_BUDGET} spent")
+            raise BudgetSpent(f"budget of {CALL_BUDGET} ask_ai calls spent")
         spent += 1
         log_line(f"ask_ai #{spent} allowed")
         try:
@@ -174,14 +180,25 @@ def build_tools(infer):
     return {"ask_ai": (ASK_AI, ask_ai)}
 
 
-def print_greeting():
-    """Introduce the Kiosk, the model, and the Crib, from the settings in force."""
+def print_greeting(crib, command):
+    """Introduce the Kiosk, the model, and the Crib, from the settings in force.
+
+    `command` is the list the Kiosk launches, so the Crib line and the printed
+    command describe what actually runs.
+    """
     passed = [name for name in PASSED if name in os.environ]
     log_line("Hello! I am Kiosk. The Agent app, a kitchen in the Crib, asks me, and I ask the model on its behalf.")
     log_line(f"I can pass {', '.join(PASSED)} into the Crib. Passing now: {', '.join(passed) or 'nothing'}")
-    log_line(f"Crib: {IMAGE}, {', '.join(crib_facts(docker_command()))}")
+    facts = crib_facts(command, crib.CONFINEMENT) + crib.inspect_setup()
+    runtime = " ".join(filter(None, [crib.RUNTIME, crib.runtime_version()]))
+    log_line(f"Crib: {', '.join([f'{crib.IMAGE} on {runtime}', *facts])}")
+    if crib.BY_DESIGN:
+        log_line(f"by design: {', '.join(crib.BY_DESIGN)}")
+    limits = crib_facts(command, crib.LIMITS) + crib.inspect_limits()
+    log_line(f"limits: {', '.join(limits) or 'none'}")
+    log_line(f"command: {shlex.join(command)}")
     log_line(inference.describe_backend())
-    log_line(f"budget: {CALL_BUDGET} ask_ai calls")
+    log_line(f"stops: after {CALL_BUDGET} ask_ai calls, after {RUN_LIMIT} seconds, on any message that is not MCP")
     if MCP_TRACE:
         log_line("trace: on, every MCP message shown as formatted JSON")
     else:
@@ -195,10 +212,50 @@ def describe_exit(exit_status):
     return f"the Agent app failed (exit {exit_status})"
 
 
+def stop_crib(crib, run_name):
+    """Stop the Crib by name, with its runtime's own command.
+
+    A signal to the launch command is not a stop: `container` 1.5.0 answers
+    one with an error and keeps the container running.
+    """
+    try:
+        subprocess.run(crib.stop_command(run_name), capture_output=True, timeout=STOP_WAIT)
+    except (OSError, subprocess.SubprocessError) as error:
+        log_line(f"the stop command failed: {error}")
+
+
+def await_crib(agent_app):
+    """Return the launch command's exit status, killing it when it outlives the stopped Crib."""
+    try:
+        return agent_app.wait(timeout=STOP_WAIT)
+    except subprocess.TimeoutExpired:
+        log_line("the Crib's command is still running, killing it")
+        agent_app.kill()
+        return agent_app.wait()
+
+
 def main():
-    """Start the Crib, serve it until the Agent app exits, and return its exit status."""
-    print_greeting()
-    agent_app = mcp_server.launch_client(docker_command())
+    """Start the Crib, serve it until the Agent app exits or a stop fires, and return the exit status."""
+    crib = pick_crib()
+    if crib is None:
+        log_line(f"unknown CRIB {os.environ['CRIB']!r}, pick one of: {', '.join(CRIBS)}")
+        return EXIT_USAGE
+    run_name = f"kiosk-crib-run-{os.getpid()}"
+    command = crib.build_command(PASSED, run_name)
+    print_greeting(crib, command)
+    agent_app = mcp_server.launch_client(command)
+    timed_out = threading.Event()
+
+    def stop_late():
+        """Stop a Crib that has run past the time limit, from beside the blocked serve loop."""
+        timed_out.set()
+        log_line(f"time limit of {RUN_LIMIT} seconds passed, stopping the Crib")
+        stop_crib(crib, run_name)
+
+    timer = threading.Timer(RUN_LIMIT, stop_late)
+    timer.daemon = True
+    timer.start()
+    stopped = None
     try:
         mcp_server.serve_client(
             agent_app.stdout,
@@ -210,22 +267,29 @@ def main():
         )
     except mcp_server.ProtocolError as error:
         log_line(f"protocol violation, stopping the Crib: {error}")
-        agent_app.terminate()
-        agent_app.wait()
-        return EXIT_PROTOCOL_VIOLATION
+        stopped = EXIT_PROTOCOL_VIOLATION
+    except BudgetSpent as error:
+        log_line(f"{error}, stopping the Crib")
+        stopped = EXIT_BUDGET_SPENT
     except BrokenPipeError:
-        log_line("the Agent app closed its stream mid-answer")
+        if not timed_out.is_set():
+            log_line("the Agent app closed its stream mid-answer")
     except KeyboardInterrupt:
-        # Ctrl-C reaches the docker client too, which passes it into the Crib.
-        log_line("interrupted, waiting for the Crib to stop")
-        agent_app.wait()
-        return EXIT_INTERRUPTED
+        log_line("interrupted, stopping the Crib")
+        stopped = EXIT_INTERRUPTED
     finally:
+        timer.cancel()
         try:
             agent_app.stdin.close()
         except BrokenPipeError:
             pass
-    exit_status = agent_app.wait()
+    if timed_out.is_set():
+        stopped = EXIT_TIME_LIMIT
+    elif stopped is not None:
+        stop_crib(crib, run_name)
+    exit_status = await_crib(agent_app)
+    if stopped is not None:
+        return stopped
     log_line(describe_exit(exit_status))
     log_line("Goodbye!")
     return exit_status

@@ -273,7 +273,7 @@ def print_greeting(tools: list[str]) -> None:
 
 def main():
     tools = mcp_client.open_channel(
-        needed=("ask_ai",), client_info={"name": "carbonara", "version": "0.1.0"}
+        needed=("ask_ai",), client_info={"name": "carbonara", "version": "0.2.0"}
     )
     print(__doc__)
     print(f"\n{'-' * 60}")

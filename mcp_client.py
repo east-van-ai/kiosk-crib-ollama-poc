@@ -15,7 +15,7 @@ PROTOCOL_VERSION = "2026-07-28"
 
 _reader = None
 _writer = None
-_client_info = {"name": "mcp_client", "version": "0.1.0"}
+_client_info = {"name": "mcp_client", "version": "0.2.0"}
 _next_id = 0
 
 

@@ -7,10 +7,14 @@
 .weed-out-ignore
 backend_ollama.py
 carbonara.py
+crib_apple_container.py
+crib_container_machine.py
+crib_docker.py
 kiosk.py
 mcp_client.py
 mcp_server.py
 tests/
 Dockerfile
+Dockerfile.machine
 LICENSE
 README.md

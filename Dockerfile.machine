@@ -1,0 +1,10 @@
+# For Apple's container machine. Not for Docker and Apple container.
+# A container machine boots /sbin/init, which kiosk-crib-apple-container lacks.
+# The init only keeps the machine up; the Kiosk runs the Agent with
+# `container machine run`.
+
+FROM kiosk-crib-apple-container
+
+USER root
+RUN printf '#!/bin/sh\nexec sleep infinity\n' > /sbin/init && chmod 755 /sbin/init
+USER nobody
